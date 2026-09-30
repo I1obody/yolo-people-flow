@@ -25,6 +25,7 @@ class PeopleCounter:
         self.tracks = {}
         self.next_id = 1
         self.counted_ids = set()
+        self.max_missed_frames = 10
         
         # Статистика
         self.total_count = 0
@@ -50,7 +51,7 @@ class PeopleCounter:
         unmatched_tracks = set(self.tracks.keys())
         unmatched_detections = set(range(len(current_centers)))
         
-        for track_id, track_data in self.tracks.items():
+        for track_id, track_data in list(self.tracks.items()):
             last_cx, last_cy = track_data['last_center']
             best_match = None
             best_dist = float('inf')
@@ -58,21 +59,16 @@ class PeopleCounter:
             for idx in unmatched_detections:
                 cx, cy, _ = current_centers[idx]
                 dist = np.sqrt((cx - last_cx)**2 + (cy - last_cy)**2)
-                if dist < best_dist and dist < 100:  # порог
+                if dist < best_dist and dist < 150:  # порог увеличен
                     best_dist = dist
                     best_match = idx
             
             if best_match is not None:
                 cx, cy, det = current_centers[best_match]
-                self.tracks[track_id]['last_center'] = (cx, cy)
-                self.tracks[track_id]['last_y'] = cy
-                self.tracks[track_id]['bbox'] = det['bbox']
-                self.tracks[track_id]['active'] = True
-                
-                # Проверка пересечения линии
                 prev_y = self.tracks[track_id]['prev_y']
                 curr_y = cy
                 
+                # Проверка пересечения линии ДО обновления prev_y
                 if prev_y < line_y <= curr_y and track_id not in self.counted_ids:
                     self.enter_count += 1
                     self.total_count += 1
@@ -84,9 +80,23 @@ class PeopleCounter:
                     self.counted_ids.add(track_id)
                     print(f"Человек вышел: ID {track_id}")
                 
+                # Обновление трека
+                self.tracks[track_id]['last_center'] = (cx, cy)
+                self.tracks[track_id]['last_y'] = cy
+                self.tracks[track_id]['bbox'] = det['bbox']
                 self.tracks[track_id]['prev_y'] = curr_y
+                self.tracks[track_id]['missed_frames'] = 0
+                self.tracks[track_id]['active'] = True
+                
                 unmatched_tracks.discard(track_id)
                 unmatched_detections.discard(best_match)
+            else:
+                # Трекинг потерян, увеличиваем счетчик пропущенных кадров
+                self.tracks[track_id]['missed_frames'] = self.tracks[track_id].get('missed_frames', 0) + 1
+                if self.tracks[track_id]['missed_frames'] > self.max_missed_frames:
+                    # Удаляем трек только после нескольких пропусков
+                    if self.tracks[track_id]['active']:
+                        self.tracks[track_id]['active'] = False
         
         # Новые треки
         for idx in unmatched_detections:
@@ -96,15 +106,15 @@ class PeopleCounter:
                 'last_y': cy,
                 'prev_y': cy,
                 'bbox': det['bbox'],
-                'active': True
+                'active': True,
+                'missed_frames': 0
             }
             self.next_id += 1
         
         # Удаление неактивных треков
         tracks_to_remove = []
-        for track_id in unmatched_tracks:
-            if self.tracks[track_id]['active']:
-                self.tracks[track_id]['active'] = False
+        for track_id in list(self.tracks.keys()):
+            if not self.tracks[track_id]['active'] and self.tracks[track_id].get('missed_frames', 0) > self.max_missed_frames:
                 tracks_to_remove.append(track_id)
         
         for track_id in tracks_to_remove:
@@ -138,7 +148,7 @@ class PeopleCounter:
         h, w = frame.shape[:2]
         line_y = self.get_line_y(h)
         cv2.line(annotated, (0, line_y), (w, line_y), (0, 255, 0), 2)
-        cv2.putText(annotated, f"Count Line", (10, line_y - 10), 
+        cv2.putText(annotated, f"Count Line", (10, line_y - 10),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         
         # Статистика на кадре
@@ -159,8 +169,17 @@ class PeopleCounter:
         }
         
         df = pd.DataFrame([stats])
-        df.to_csv(output_path, index=False)
-        print(f"Статистика сохранена в {output_path}")
+        # Сохраняем в CSV с правильной кодировкой
+        csv_path = output_path
+        if not csv_path.endswith('.csv'):
+            csv_path = csv_path.replace('.xlsx', '.csv')
+        df.to_csv(csv_path, index=False, encoding='utf-8-sig')
+        
+        # Также сохраняем в Excel для корректного отображения
+        excel_path = csv_path.replace('.csv', '.xlsx')
+        df.to_excel(excel_path, index=False)
+        
+        print(f"Статистика сохранена в {csv_path} и {excel_path}")
         return stats
 
 def main():
@@ -187,16 +206,27 @@ def main():
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    # Определяем кодек в зависимости от формата выходного файла
+    if args.output.lower().endswith('.avi'):
+        fourcc = cv2.VideoWriter_fourcc(*'XVID')
+    elif args.output.lower().endswith('.mkv'):
+        fourcc = cv2.VideoWriter_fourcc(*'XVID')
+    else:
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(args.output, fourcc, fps, (width, height))
     
     counter = PeopleCounter(model_path=args.model, conf=args.conf, line_y_ratio=args.line_ratio)
     
     frame_num = 0
+    skip_frames = max(1, int(fps / 30))  # Process at ~30 FPS max
     while True:
         ret, frame = cap.read()
         if not ret:
             break
+        
+        if frame_num % skip_frames != 0:
+            frame_num += 1
+            continue
         
         annotated, count = counter.process_frame(frame)
         out.write(annotated)
@@ -205,14 +235,13 @@ def main():
         if frame_num % 30 == 0:
             print(f"Кадр {frame_num}: людей на кадре = {count}, всего подсчитано = {counter.total_count}")
         
-        # Отображение
-        cv2.imshow('People Counter', annotated)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+        # Отображение (отключено для headless режима)
+        # cv2.imshow('People Counter', annotated)
+        # if cv2.waitKey(1) & 0xFF == ord('q'):
+        #     break
     
     cap.release()
     out.release()
-    cv2.destroyAllWindows()
     
     stats = counter.save_stats(args.stats)
     print("\n=== Итоговая статистика ===")
