@@ -45,14 +45,21 @@ output.mp4
 *.mkv
 stats.csv
 plots/
-*.png
-*.jpg
-*.jpeg
+
+# Results directory - all generated reports
+results/
+!results/.gitkeep
+
+# Video input directories
+ProdVideo/
+testvideo/
+
+# Model files
+yolov8n.pt
+*.pt
 
 # Ultralytics
 runs/
-yolov8n.pt
-*.pt
 
 # Logs
 *.log

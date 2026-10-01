@@ -14,6 +14,21 @@ from people_counter import PeopleCounter
 import cv2
 from tqdm import tqdm
 
+# Импорты для генерации отчетов
+try:
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib import colors
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import inch
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image, PageBreak
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    REPORTS_AVAILABLE = True
+except ImportError:
+    REPORTS_AVAILABLE = False
+
 def parse_video_filename(filename):
     """Парсит имя файла для извлечения даты"""
     # Формат: 1443 (2026-09-08 08'35'00 - 2026-09-08 09'05'00).avi
@@ -297,12 +312,224 @@ def main():
             comp_csv = os.path.join(output_dir, 'comparison_first_vs_last.csv')
             comp_df.to_csv(comp_csv, index=False, encoding='utf-8-sig')
             
+            # Сохраняем сводку по дням в Excel
+            daily_excel = os.path.join(output_dir, 'daily_comparison.xlsx')
+            daily_stats.to_excel(daily_excel, index=False)
+            
+            # Сохраняем сравнение в Excel
+            comp_excel = os.path.join(output_dir, 'comparison_first_vs_last.xlsx')
+            comp_df.to_excel(comp_excel, index=False)
+            
             print(f"\n{'='*80}")
             print(f"Результаты сохранены в папку {output_dir}/")
             print(f"  - video_stats.csv")
+            print(f"  - video_stats.xlsx")
             print(f"  - daily_comparison.csv")
+            print(f"  - daily_comparison.xlsx")
             print(f"  - comparison_first_vs_last.csv")
+            print(f"  - comparison_first_vs_last.xlsx")
             print(f"{'='*80}")
+            
+            # Генерация дополнительных отчетов
+            if REPORTS_AVAILABLE:
+                print(f"\nГенерация дополнительных отчетов...")
+                generate_reports(df, daily_stats, comp_df, output_dir)
+            else:
+                print(f"\nДля генерации PDF отчетов установите: pip install reportlab seaborn")
+
+def generate_reports(video_stats_df, daily_stats_df, comparison_df, output_dir):
+    """Генерация PDF отчета и тепловой карты"""
+    try:
+        # Регистрация шрифта
+        font_path = 'C:/Windows/Fonts/arial.ttf'
+        font_name = 'Arial'
+        if os.path.exists(font_path):
+            pdfmetrics.registerFont(TTFont('Arial', font_path))
+        else:
+            font_name = 'Helvetica'
+        
+        # Создание графиков
+        temp_plots_dir = os.path.join(output_dir, 'temp_plots')
+        os.makedirs(temp_plots_dir, exist_ok=True)
+        
+        # График 1: Среднее количество людей в кадре
+        plt.figure(figsize=(10, 6))
+        plt.plot(daily_stats_df['date'], daily_stats_df['avg_people_per_frame'], marker='o', linewidth=2)
+        plt.title('Среднее количество людей в кадре по дням', fontsize=14)
+        plt.xlabel('Дата')
+        plt.ylabel('Среднее кол-во людей в кадре')
+        plt.grid(True, alpha=0.3)
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        plt.savefig(os.path.join(temp_plots_dir, 'avg_people.png'), dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        # График 2: Вошедших/Вышедших
+        plt.figure(figsize=(10, 6))
+        plt.plot(daily_stats_df['date'], daily_stats_df['entered'], marker='o', label='Вошедших', linewidth=2)
+        plt.plot(daily_stats_df['date'], daily_stats_df['exited'], marker='s', label='Вышедших', linewidth=2)
+        plt.title('Вошедших и вышедших по дням', fontsize=14)
+        plt.xlabel('Дата')
+        plt.ylabel('Количество')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        plt.savefig(os.path.join(temp_plots_dir, 'entered_exited.png'), dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        # График 3: Коэффициенты
+        plt.figure(figsize=(10, 6))
+        plt.plot(daily_stats_df['date'], daily_stats_df['throughput_coeff'], marker='o', label='Пропускная способность (%)', linewidth=2)
+        plt.plot(daily_stats_df['date'], daily_stats_df['loss_coeff'], marker='s', label='Коэффициент отказа (%)', linewidth=2)
+        plt.title('Коэффициенты пропускной способности и отказа', fontsize=14)
+        plt.xlabel('Дата')
+        plt.ylabel('Процент')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        plt.savefig(os.path.join(temp_plots_dir, 'coeffs.png'), dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        # Тепловая карта
+        plt.figure(figsize=(12, 6))
+        heatmap_data = daily_stats_df.set_index('date')[['avg_people_per_frame']]
+        sns.heatmap(heatmap_data, annot=True, fmt='.2f', cmap='YlOrRd',
+                    cbar_kws={'label': 'Среднее кол-во людей в кадре'},
+                    linewidths=0.5)
+        plt.title('Тепловая карта среднего количества людей в кадре по дням')
+        plt.tight_layout()
+        heatmap_path = os.path.join(output_dir, 'heatmap_avg_people_per_frame.png')
+        plt.savefig(heatmap_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        # Сохраняем также в temp для PDF
+        plt.figure(figsize=(12, 6))
+        sns.heatmap(heatmap_data, annot=True, fmt='.2f', cmap='YlOrRd',
+                    cbar_kws={'label': 'Среднее кол-во людей в кадре'},
+                    linewidths=0.5)
+        plt.title('Тепловая карта среднего количества людей в кадре по дням')
+        plt.tight_layout()
+        plt.savefig(os.path.join(temp_plots_dir, 'heatmap.png'), dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        # Создание PDF
+        pdf_path = os.path.join(output_dir, 'video_analysis_report.pdf')
+        doc = SimpleDocTemplate(pdf_path, pagesize=A4, rightMargin=72, leftMargin=72, topMargin=72, bottomMargin=18)
+        
+        styles = getSampleStyleSheet()
+        for style_name in ['Normal', 'Heading1', 'Heading2', 'Heading3']:
+            if style_name in styles:
+                styles[style_name].fontName = font_name
+        
+        styles.add(ParagraphStyle(name='CenterTitle', parent=styles['Heading1'], alignment=1, fontSize=18, spaceAfter=30, fontName=font_name))
+        styles.add(ParagraphStyle(name='SectionTitle', parent=styles['Heading2'], fontSize=14, spaceBefore=20, spaceAfter=12, fontName=font_name))
+        
+        story = []
+        story.append(Spacer(1, 2*inch))
+        story.append(Paragraph('Отчет по анализу видеонаблюдения', styles['CenterTitle']))
+        story.append(Spacer(1, 0.5*inch))
+        story.append(Paragraph(f'Дата генерации: {datetime.now().strftime("%d.%m.%Y %H:%M")}', styles['Normal']))
+        story.append(Paragraph(f'Период анализа: {daily_stats_df["date"].min()} - {daily_stats_df["date"].max()}', styles['Normal']))
+        story.append(PageBreak())
+        
+        # Таблица video_stats
+        story.append(Paragraph('Сводная статистика по видео', styles['SectionTitle']))
+        video_stats_display = video_stats_df[['video_file', 'date', 'entered', 'exited', 'total_counted', 'avg_people_per_frame']].copy()
+        video_stats_display.columns = ['Видео файл', 'Дата', 'Вошедших', 'Вышедших', 'Всего', 'Среднее в кадре']
+        table_data = [list(video_stats_display.columns)] + video_stats_display.values.tolist()
+        table = Table(table_data, repeatRows=1)
+        table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('FONTNAME', (0, 0), (-1, -1), font_name),
+            ('FONTSIZE', (0, 0), (-1, 0), 8),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black),
+            ('FONTSIZE', (0, 1), (-1, -1), 7),
+        ]))
+        story.append(table)
+        story.append(Spacer(1, 0.3*inch))
+        
+        story.append(Paragraph('Динамика среднего количества людей в кадре', styles['SectionTitle']))
+        story.append(Image(os.path.join(temp_plots_dir, 'avg_people.png'), width=6*inch, height=3.5*inch))
+        story.append(PageBreak())
+        
+        # Ежедневное сравнение
+        story.append(Paragraph('Ежедневное сравнение метрик', styles['SectionTitle']))
+        daily_display = daily_stats_df.copy()
+        daily_display.columns = ['Дата', 'Вошедших', 'Вышедших', 'Всего', 'Пропускная %', 'Отказ %', 'Пик индекс', 'Скорость чел/мин', 'Среднее в кадре', 'Макс в кадре']
+        table_data = [list(daily_display.columns)] + daily_display.values.tolist()
+        table = Table(table_data, repeatRows=1)
+        table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('FONTNAME', (0, 0), (-1, -1), font_name),
+            ('FONTSIZE', (0, 0), (-1, 0), 7),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black),
+            ('FONTSIZE', (0, 1), (-1, -1), 6),
+        ]))
+        story.append(table)
+        story.append(Spacer(1, 0.3*inch))
+        
+        story.append(Paragraph('Вошедших и вышедших', styles['SectionTitle']))
+        story.append(Image(os.path.join(temp_plots_dir, 'entered_exited.png'), width=6*inch, height=3.5*inch))
+        story.append(Spacer(1, 0.2*inch))
+        
+        story.append(Paragraph('Коэффициенты', styles['SectionTitle']))
+        story.append(Image(os.path.join(temp_plots_dir, 'coeffs.png'), width=6*inch, height=3.5*inch))
+        story.append(PageBreak())
+        
+        # Сравнение периодов
+        story.append(Paragraph('Сравнение первого и последнего периода', styles['SectionTitle']))
+        comparison_display = comparison_df.copy()
+        comparison_display.columns = ['Метрика', 'Среднее первые 3', 'Среднее последние 3', 'Изменение %']
+        table_data = [list(comparison_display.columns)] + comparison_display.values.tolist()
+        table = Table(table_data, repeatRows=1)
+        table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('FONTNAME', (0, 0), (-1, -1), font_name),
+            ('FONTSIZE', (0, 0), (-1, 0), 9),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black),
+            ('FONTSIZE', (0, 1), (-1, -1), 8),
+        ]))
+        story.append(table)
+        story.append(Spacer(1, 0.3*inch))
+        
+        story.append(Paragraph('Тепловая карта среднего количества людей в кадре', styles['SectionTitle']))
+        story.append(Image(os.path.join(temp_plots_dir, 'heatmap.png'), width=6*inch, height=3*inch))
+        
+        story.append(PageBreak())
+        story.append(Paragraph('Выводы', styles['SectionTitle']))
+        story.append(Paragraph(f'За период с {daily_stats_df["date"].min()} по {daily_stats_df["date"].max()} проанализировано {len(video_stats_df)} видеофайлов.', styles['Normal']))
+        story.append(Spacer(1, 0.1*inch))
+        story.append(Paragraph(f'Среднее количество вошедших: {daily_stats_df["entered"].mean():.1f} человек/день', styles['Normal']))
+        story.append(Paragraph(f'Среднее количество вышедших: {daily_stats_df["exited"].mean():.1f} человек/день', styles['Normal']))
+        story.append(Paragraph(f'Средняя пропускная способность: {daily_stats_df["throughput_coeff"].mean():.1f}%', styles['Normal']))
+        story.append(Paragraph(f'Средний коэффициент отказа: {daily_stats_df["loss_coeff"].mean():.1f}%', styles['Normal']))
+        
+        doc.build(story)
+        
+        # Очистка временных файлов
+        import shutil
+        if os.path.exists(temp_plots_dir):
+            shutil.rmtree(temp_plots_dir)
+        
+        print(f"  - video_analysis_report.pdf")
+        print(f"  - heatmap_avg_people_per_frame.png")
+        
+    except Exception as e:
+        print(f"Ошибка при генерации отчетов: {e}")
 
 if __name__ == '__main__':
     main()
