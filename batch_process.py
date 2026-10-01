@@ -1,0 +1,308 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Пакетная обработка всех видео из ProdVideo с расчетом метрик
+"""
+
+import os
+import re
+import pandas as pd
+import numpy as np
+from datetime import datetime
+import subprocess
+from people_counter import PeopleCounter
+import cv2
+from tqdm import tqdm
+
+def parse_video_filename(filename):
+    """Парсит имя файла для извлечения даты"""
+    # Формат: 1443 (2026-09-08 08'35'00 - 2026-09-08 09'05'00).avi
+    pattern = r'\((\d{4}-\d{2}-\d{2})'
+    match = re.search(pattern, filename)
+    if match:
+        return match.group(1)
+    return None
+
+def get_video_duration(video_path):
+    """Получает длительность видео через ffprobe"""
+    try:
+        cmd = [
+            'ffprobe', '-v', 'error',
+            '-show_entries', 'format=duration',
+            '-of', 'default=noprint_wrappers=1:nokey=1',
+            video_path
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            return float(result.stdout.strip())
+    except:
+        pass
+    return None
+
+def get_real_fps(cap, fps, video_path):
+    """Определяет реальный FPS видео"""
+    if fps > 120:
+        try:
+            cmd = [
+                'ffprobe', '-v', 'error',
+                '-select_streams', 'v:0',
+                '-show_entries', 'stream=r_frame_rate,avg_frame_rate,time_base,duration',
+                '-of', 'default=noprint_wrappers=1:nokey=1',
+                video_path
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+            if result.returncode == 0:
+                lines = result.stdout.strip().split('\n')
+                if len(lines) >= 4:
+                    r_num, r_den = map(int, lines[0].split('/'))
+                    r_fps = r_num / r_den if r_den != 0 else fps
+                    if 1 <= r_fps <= 120:
+                        return r_fps
+        except:
+            pass
+        return 30.0
+    return fps
+
+def process_video(video_path, output_dir):
+    """Обрабатывает одно видео и возвращает статистику"""
+    print(f"\n{'='*60}")
+    print(f"Обработка: {os.path.basename(video_path)}")
+    print(f"{'='*60}")
+    
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f"Ошибка: не удалось открыть видео {video_path}")
+        return None
+    
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    
+    fps = get_real_fps(cap, fps, video_path)
+    duration = get_video_duration(video_path)
+    
+    print(f"FPS: {fps}, Разрешение: {width}x{height}, Длительность: {duration}s")
+    
+    # Создаем счетчик
+    counter = PeopleCounter(model_path='yolov8n.pt', conf=0.4, line_y_ratio=0.5)
+    
+    # Обработка кадров
+    frame_num = 0
+    processed_frames = 0
+    skip_frames = max(1, int(fps / 30))
+    
+    total_frames = int(duration * fps) if duration else int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    pbar = tqdm(total=total_frames, desc="Обработка", unit="кадр")
+    
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        frame_num += 1
+        if frame_num % skip_frames != 0:
+            continue
+        
+        # Обработка кадра
+        results = counter.model(frame, conf=counter.conf, iou=counter.iou, verbose=False)
+        
+        detections = []
+        for r in results:
+            boxes = r.boxes
+            if boxes is not None:
+                for box in boxes:
+                    cls = int(box.cls[0])
+                    if cls == 0:  # person
+                        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                        conf = float(box.conf[0])
+                        detections.append({
+                            'bbox': [int(x1), int(y1), int(x2), int(y2)],
+                            'conf': conf
+                        })
+        
+        counter.update_tracks(detections, frame.shape[0])
+        counter.frame_counts.append(len(detections))
+        
+        processed_frames += 1
+        pbar.update(skip_frames)
+    
+    cap.release()
+    pbar.close()
+    
+    # Расчет метрик
+    total_people = counter.enter_count + counter.exit_count
+    entered = counter.enter_count
+    exited = counter.exit_count
+    
+    # Всего людей в кадре (сумма по всем кадрам)
+    total_people_in_frames = sum(counter.frame_counts)
+    avg_people = np.mean(counter.frame_counts) if counter.frame_counts else 0
+    max_people = max(counter.frame_counts) if counter.frame_counts else 0
+    
+    # Метрики
+    # Коэффициент пропускной способности
+    if total_people > 0:
+        throughput_coeff = (entered / total_people) * 100
+    else:
+        throughput_coeff = 0
+    
+    # Коэффициент отказа (оттока)
+    if total_people > 0:
+        loss_coeff = (exited / total_people) * 100
+    else:
+        loss_coeff = 0
+    
+    # Индекс пиковой нагрузки
+    if avg_people > 0:
+        peak_index = max_people / avg_people
+    else:
+        peak_index = 0
+    
+    # Скорость обработки (Throughput per minute)
+    throughput_per_min = entered / 30 if duration and duration > 0 else 0
+    
+    stats = {
+        'video_file': os.path.basename(video_path),
+        'date': parse_video_filename(os.path.basename(video_path)),
+        'duration_sec': duration,
+        'fps': fps,
+        'total_frames': total_frames,
+        'entered': entered,
+        'exited': exited,
+        'total_counted': total_people,
+        'avg_people_per_frame': avg_people,
+        'max_people_per_frame': max_people,
+        'throughput_coeff': throughput_coeff,
+        'loss_coeff': loss_coeff,
+        'peak_index': peak_index,
+        'throughput_per_min': throughput_per_min,
+        'total_people_in_frames': total_people_in_frames
+    }
+    
+    print(f"\nРезультаты для {os.path.basename(video_path)}:")
+    print(f"  Вошедших: {entered}")
+    print(f"  Вышедших: {exited}")
+    print(f"  Коэффициент пропускной способности: {throughput_coeff:.2f}%")
+    print(f"  Коэффициент отказа: {loss_coeff:.2f}%")
+    print(f"  Индекс пиковой нагрузки: {peak_index:.2f}")
+    print(f"  Скорость обработки: {throughput_per_min:.2f} чел/мин")
+    
+    return stats
+
+def main():
+    import numpy as np
+    
+    prod_video_dir = 'ProdVideo'
+    output_dir = 'results'
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Получаем список видео
+    video_files = []
+    for file in os.listdir(prod_video_dir):
+        if file.endswith('.avi') or file.endswith('.mp4'):
+            video_files.append(os.path.join(prod_video_dir, file))
+    
+    video_files.sort()
+    
+    print(f"Найдено видео: {len(video_files)}")
+    for f in video_files:
+        print(f"  - {os.path.basename(f)}")
+    
+    all_stats = []
+    
+    for video_path in video_files:
+        stats = process_video(video_path, output_dir)
+        if stats:
+            all_stats.append(stats)
+    
+    # Сохраняем результаты
+    if all_stats:
+        df = pd.DataFrame(all_stats)
+        
+        # Сохраняем в CSV
+        csv_path = os.path.join(output_dir, 'video_stats.csv')
+        df.to_csv(csv_path, index=False, encoding='utf-8-sig')
+        
+        # Сохраняем в Excel
+        excel_path = os.path.join(output_dir, 'video_stats.xlsx')
+        df.to_excel(excel_path, index=False)
+        
+        # Сравнение дней
+        print(f"\n{'='*80}")
+        print("СРАВНЕНИЕ ДНЕЙ")
+        print(f"{'='*80}")
+        
+        # Группируем по датам
+        daily_stats = df.groupby('date').agg({
+            'entered': 'sum',
+            'exited': 'sum',
+            'total_counted': 'sum',
+            'throughput_coeff': 'mean',
+            'loss_coeff': 'mean',
+            'peak_index': 'mean',
+            'throughput_per_min': 'mean',
+            'avg_people_per_frame': 'mean',
+            'max_people_per_frame': 'max'
+        }).reset_index()
+        
+        print("\nСтатистика по дням:")
+        print(daily_stats.to_string(index=False))
+        
+        # Сохраняем сводку по дням
+        daily_csv = os.path.join(output_dir, 'daily_comparison.csv')
+        daily_stats.to_csv(daily_csv, index=False, encoding='utf-8-sig')
+        
+        # Сравнение первых 3 дней с последними 3
+        if len(daily_stats) >= 6:
+            first_3 = daily_stats.head(3)
+            last_3 = daily_stats.tail(3)
+            
+            print(f"\n{'='*80}")
+            print("СРАВНЕНИЕ: Первые 3 дня vs Последние 3 дня")
+            print(f"{'='*80}")
+            
+            comparison = {
+                'metric': [],
+                'first_3_avg': [],
+                'last_3_avg': [],
+                'change_pct': []
+            }
+            
+            metrics = [
+                ('entered', 'Вошедших'),
+                ('exited', 'Вышедших'),
+                ('throughput_coeff', 'Коэффициент пропускной способности (%)'),
+                ('loss_coeff', 'Коэффициент отказа (%)'),
+                ('peak_index', 'Индекс пиковой нагрузки'),
+                ('throughput_per_min', 'Скорость обработки (чел/мин)'),
+                ('avg_people_per_frame', 'Среднее кол-во людей в кадре')
+            ]
+            
+            for metric_key, metric_name in metrics:
+                first_avg = first_3[metric_key].mean()
+                last_avg = last_3[metric_key].mean()
+                change = ((last_avg - first_avg) / first_avg * 100) if first_avg != 0 else 0
+                
+                comparison['metric'].append(metric_name)
+                comparison['first_3_avg'].append(first_avg)
+                comparison['last_3_avg'].append(last_avg)
+                comparison['change_pct'].append(change)
+                
+                print(f"\n{metric_name}:")
+                print(f"  Первые 3 дня: {first_avg:.2f}")
+                print(f"  Последние 3 дня: {last_avg:.2f}")
+                print(f"  Изменение: {change:+.2f}%")
+            
+            comp_df = pd.DataFrame(comparison)
+            comp_csv = os.path.join(output_dir, 'comparison_first_vs_last.csv')
+            comp_df.to_csv(comp_csv, index=False, encoding='utf-8-sig')
+            
+            print(f"\n{'='*80}")
+            print(f"Результаты сохранены в папку {output_dir}/")
+            print(f"  - video_stats.csv")
+            print(f"  - daily_comparison.csv")
+            print(f"  - comparison_first_vs_last.csv")
+            print(f"{'='*80}")
+
+if __name__ == '__main__':
+    main()

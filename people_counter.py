@@ -71,12 +71,14 @@ class PeopleCounter:
                 curr_y = cy
                 
                 # Проверка пересечения линии ДО обновления prev_y
-                if prev_y < line_y <= curr_y and track_id not in self.counted_ids:
+                # Вошедшие: с нижнего края (большие y) в верхний (меньшие y) - движение вверх
+                # В координатах OpenCV y увеличивается вниз, поэтому движение вверх = уменьшение y
+                if prev_y > line_y >= curr_y and track_id not in self.counted_ids:
                     self.enter_count += 1
                     self.total_count += 1
                     self.counted_ids.add(track_id)
                     print(f"\nЧеловек вошел: ID {track_id}")
-                elif prev_y > line_y >= curr_y and track_id not in self.counted_ids:
+                elif prev_y < line_y <= curr_y and track_id not in self.counted_ids:
                     self.exit_count += 1
                     self.total_count += 1
                     self.counted_ids.add(track_id)
