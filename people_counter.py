@@ -13,6 +13,8 @@ from collections import defaultdict
 import pandas as pd
 from datetime import datetime
 import os
+import subprocess
+from tqdm import tqdm
 
 class PeopleCounter:
     def __init__(self, model_path='yolov8n.pt', conf=0.4, iou=0.5, line_y_ratio=0.5):
@@ -73,12 +75,12 @@ class PeopleCounter:
                     self.enter_count += 1
                     self.total_count += 1
                     self.counted_ids.add(track_id)
-                    print(f"Человек вошел: ID {track_id}")
+                    print(f"\nЧеловек вошел: ID {track_id}")
                 elif prev_y > line_y >= curr_y and track_id not in self.counted_ids:
                     self.exit_count += 1
                     self.total_count += 1
                     self.counted_ids.add(track_id)
-                    print(f"Человек вышел: ID {track_id}")
+                    print(f"\nЧеловек вышел: ID {track_id}")
                 
                 # Обновление трека
                 self.tracks[track_id]['last_center'] = (cx, cy)
@@ -206,6 +208,71 @@ def main():
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     
+    # Исправление FPS для AVI с некорректным avg_frame_rate
+    # OpenCV может возвращать 1000 fps вместо реальных 30 для некоторых AVI
+    def get_real_fps(cap, fps):
+        # Если FPS слишком высокий (>120) - вероятно ошибка метаданных
+        if fps > 120:
+            try:
+                # Пытаемся получить реальный FPS через ffprobe
+                cmd = [
+                    'ffprobe', '-v', 'error',
+                    '-select_streams', 'v:0',
+                    '-show_entries', 'stream=r_frame_rate,avg_frame_rate,time_base,duration',
+                    '-of', 'default=noprint_wrappers=1:nokey=1',
+                    args.video
+                ]
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+                if result.returncode == 0:
+                    lines = result.stdout.strip().split('\n')
+                    if len(lines) >= 4:
+                        r_num, r_den = map(int, lines[0].split('/'))
+                        a_num, a_den = map(int, lines[1].split('/'))
+                        r_fps = r_num / r_den if r_den != 0 else fps
+                        a_fps = a_num / a_den if a_den != 0 else fps
+                        # Используем r_frame_rate если он разумен
+                        if 1 <= r_fps <= 120:
+                            print(f"Исправление FPS: OpenCV={fps}, r_frame_rate={r_fps}, avg_frame_rate={a_fps}")
+                            return r_fps
+                        # Если r_frame_rate не разумен, но есть duration и frame_count, вычислить FPS
+                        frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+                        if frame_count > 0:
+                            try:
+                                duration = float(lines[3])
+                                if duration > 0:
+                                    calc_fps = frame_count / duration
+                                    if 1 <= calc_fps <= 120:
+                                        print(f"Исправление FPS по duration: OpenCV={fps}, calc_fps={calc_fps:.2f}, duration={duration}")
+                                        return calc_fps
+                            except:
+                                pass
+                        # Альтернативный расчет: используем time_base для вычисления FPS
+                        try:
+                            tb_num, tb_den = map(int, lines[2].split('/'))
+                            time_base = tb_num / tb_den if tb_den != 0 else 1/1000
+                            # Для AVI с time_base 1/1000 и frame_count, реальный FPS = frame_count / duration
+                            # Но если duration недоступен, используем r_frame_rate
+                            if r_fps > 120 or r_fps < 1:
+                                # Попробуем вычислить из time_base и avg_frame_rate
+                                if a_fps > 120:
+                                    # Для AVI с avg_frame_rate=1000/1, реальный FPS обычно 30
+                                    print(f"Обнаружен AVI с некорректным avg_frame_rate: {a_fps}, используем r_frame_rate={r_fps}")
+                                    if 1 <= r_fps <= 120:
+                                        return r_fps
+                        except:
+                            pass
+            except Exception as e:
+                print(f"ffprobe недоступен, используем эвристику: {e}")
+        
+        # Эвристика: если fps > 120, пробуем использовать 30 как дефолт
+        if fps > 120:
+            print(f"Предупреждение: FPS={fps} слишком высокий, используем 30 fps")
+            return 30.0
+        
+        return fps
+    
+    fps = get_real_fps(cap, fps)
+    
     # Определяем кодек в зависимости от формата выходного файла
     if args.output.lower().endswith('.avi'):
         fourcc = cv2.VideoWriter_fourcc(*'XVID')
@@ -217,23 +284,72 @@ def main():
     
     counter = PeopleCounter(model_path=args.model, conf=args.conf, line_y_ratio=args.line_ratio)
     
+    # Получаем реальную длительность видео
+    try:
+        cmd_duration = [
+            'ffprobe', '-v', 'error',
+            '-show_entries', 'format=duration',
+            '-of', 'default=noprint_wrappers=1:nokey=1',
+            args.video
+        ]
+        result_duration = subprocess.run(cmd_duration, capture_output=True, text=True, timeout=5)
+        if result_duration.returncode == 0:
+            video_duration = float(result_duration.stdout.strip())
+            print(f"Длительность видео: {video_duration:.2f} сек")
+        else:
+            video_duration = None
+    except:
+        video_duration = None
+    
+    original_fps = cap.get(cv2.CAP_PROP_FPS)
+    opencv_frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    
+    # Вычисляем реальное количество кадров
+    if video_duration and video_duration > 0:
+        real_frame_count = int(video_duration * fps)
+        print(f"Реальное количество кадров: {real_frame_count}, OpenCV сообщает: {opencv_frame_count}")
+    else:
+        real_frame_count = opencv_frame_count
+    
+    # Фактор пропуска кадров из-за некорректного FPS в AVI
+    skip_factor = 1
+    if original_fps > 120 and video_duration and video_duration > 0:
+        if opencv_frame_count > real_frame_count:
+            skip_factor = int(opencv_frame_count / real_frame_count)
+            print(f"Фактор пропуска кадров: {skip_factor}")
+    
+    # Skip frames для обработки (макс 30 FPS)
+    # При skip_factor > 1, мы читаем каждый skip_factor-й кадр из OpenCV
+    # чтобы получить реальный кадр
+    skip_frames = max(1, int(fps / 30)) * skip_factor
+    print(f"skip_frames: {skip_frames}")
+    
+    # Создаем прогресс-бар на основе реального количества кадров
+    total_frames = real_frame_count
+    print(f"Обработка видео: {total_frames} кадров")
+    pbar = tqdm(total=total_frames, desc="Обработка", unit="кадр")
+    
     frame_num = 0
-    skip_frames = max(1, int(fps / 30))  # Process at ~30 FPS max
+    processed_frames = 0
     while True:
         ret, frame = cap.read()
         if not ret:
             break
         
+        frame_num += 1
+        
         if frame_num % skip_frames != 0:
-            frame_num += 1
             continue
         
         annotated, count = counter.process_frame(frame)
-        out.write(annotated)
+        # Записываем кадр skip_frames раз для сохранения длительности
+        for _ in range(skip_frames):
+            out.write(annotated)
         
-        frame_num += 1
-        if frame_num % 30 == 0:
-            print(f"Кадр {frame_num}: людей на кадре = {count}, всего подсчитано = {counter.total_count}")
+        processed_frames += 1
+        pbar.update(skip_frames)
+        if processed_frames % 30 == 0:
+            pbar.set_postfix({'людей': count, 'всего': counter.total_count})
         
         # Отображение (отключено для headless режима)
         # cv2.imshow('People Counter', annotated)
@@ -242,6 +358,7 @@ def main():
     
     cap.release()
     out.release()
+    pbar.close()
     
     stats = counter.save_stats(args.stats)
     print("\n=== Итоговая статистика ===")
